@@ -1,16 +1,36 @@
 """
-Sending and receiving 433/315Mhz signals with low-cost GPIO RF Modules on a Raspberry Pi.
+Sending and receiving 433/315Mhz signals with low-cost RF Modules with micropython.
 """
-
-import logging
-import time
+#import time
+import utime
 from collections import namedtuple
-
-from RPi import GPIO
+# to enable some debugging when using interrupts
+import micropython
+micropython.alloc_emergency_exception_buf(100)
+# from RPi import GPIO
+from machine import Pin
 
 MAX_CHANGES = 67
 
-_LOGGER = logging.getLogger(__name__)
+class Logger:
+
+    def __init__(self, name):
+        self._name = name
+
+    def debug(self, msg):
+        print(self._name + ":DEBUG:" + msg)
+
+    def info(self, msg):
+        print(self._name + ":INFO:" + msg)
+
+    def error(self, msg):
+        print(self._name + ":ERROR:" + msg)
+
+    def exception(self, exc):
+        print(self._name + ":EXCEPTION:" + exc)
+
+
+_LOGGER = Logger(__name__)
 
 Protocol = namedtuple('Protocol',
                       ['pulselength',
@@ -27,13 +47,22 @@ PROTOCOLS = (None,
 
 
 class RFDevice:
-    """Representation of a GPIO RF device."""
+    """Representation of a RF device eihter RX or TX module"""
 
     # pylint: disable=too-many-instance-attributes,too-many-arguments
-    def __init__(self, gpio,
+    def __init__(self, pin_num,
                  tx_proto=1, tx_pulselength=None, tx_repeat=10, tx_length=24, rx_tolerance=80):
-        """Initialize the RF device."""
-        self.gpio = gpio
+        """
+        Initialize the RF device.
+        :param pin: pin number to read tx or rx from
+        :param tx_proto:
+        :patam tx_pulselenght:
+        :param tx_repeat:
+        :param tc_length:
+        :param rx_tolerance:
+        """
+        self.pin_num = pin_num
+        self.pin = None # depends on Mode
         self.tx_enabled = False
         self.tx_proto = tx_proto
         if tx_pulselength:
@@ -56,8 +85,8 @@ class RFDevice:
         self.rx_bitlength = None
         self.rx_pulselength = None
 
-        GPIO.setmode(GPIO.BCM)
-        _LOGGER.debug("Using GPIO " + str(gpio))
+        # GPIO.setmode(GPIO.BCM) not necessary on micropython
+        _LOGGER.debug("Using pin " + str(pin_num))
 
     def cleanup(self):
         """Disable TX and RX and clean up GPIO."""
@@ -65,8 +94,9 @@ class RFDevice:
             self.disable_tx()
         if self.rx_enabled:
             self.disable_rx()
-        _LOGGER.debug("Cleanup")
-        GPIO.cleanup()
+        # i think the below code is not necessary
+        # _LOGGER.debug("Cleanup") # set Pins to initial state
+        # GPIO.cleanup()
 
     def enable_tx(self):
         """Enable TX, set up GPIO."""
@@ -75,7 +105,8 @@ class RFDevice:
             return False
         if not self.tx_enabled:
             self.tx_enabled = True
-            GPIO.setup(self.gpio, GPIO.OUT)
+            self.pin = Pin(self.pin_num, Pin.IN, Pin.PULL_UP) # TODO: not sure with PULL_UP
+            # GPIO.setup(self.gpio, GPIO.OUT)
             _LOGGER.debug("TX enabled")
         return True
 
@@ -83,7 +114,8 @@ class RFDevice:
         """Disable TX, reset GPIO."""
         if self.tx_enabled:
             # set up GPIO pin as input for safety
-            GPIO.setup(self.gpio, GPIO.IN)
+            self.pin = Pin(self.pin_num, Pin.IN)
+            # GPIO.setup(self.gpio, GPIO.IN)
             self.tx_enabled = False
             _LOGGER.debug("TX disabled")
         return True
@@ -172,10 +204,14 @@ class RFDevice:
         if not self.tx_enabled:
             _LOGGER.error("TX is not enabled, not sending data")
             return False
-        GPIO.output(self.gpio, GPIO.HIGH)
-        self._sleep((highpulses * self.tx_pulselength) / 1000000)
-        GPIO.output(self.gpio, GPIO.LOW)
-        self._sleep((lowpulses * self.tx_pulselength) / 1000000)
+        self.pin.value(Pin.HIGH)
+        # GPIO.output(self.gpio, GPIO.HIGH)
+        utime.sleep_us(highpulses * self.tx_pulselength)
+        # self._sleep((highpulses * self.tx_pulselength) / 1000000)
+        self.pin.value(Pin.LOW)
+        # GPIO.output(self.gpio, GPIO.LOW)
+        utime.sleep_us(lowpulses * self.tx_pulselength)
+        # self._sleep((lowpulses * self.tx_pulselength) / 1000000)
         return True
 
     def enable_rx(self):
@@ -185,27 +221,33 @@ class RFDevice:
             return False
         if not self.rx_enabled:
             self.rx_enabled = True
-            GPIO.setup(self.gpio, GPIO.IN)
-            GPIO.add_event_detect(self.gpio, GPIO.BOTH)
-            GPIO.add_event_callback(self.gpio, self.rx_callback)
+            self.pin = Pin(self.pin_num, Pin.IN, pull=Pin.PULL_UP) # TODO: not sure about PULL_UP
+            self.pin.irq(handler=self.rx_callback, trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING) # to get both = 3
+            #GPIO.setup(self.gpio, GPIO.IN)
+            #GPIO.add_event_detect(self.gpio, GPIO.BOTH)
+            #GPIO.add_event_callback(self.gpio, self.rx_callback)
             _LOGGER.debug("RX enabled")
         return True
 
     def disable_rx(self):
         """Disable RX, remove GPIO event detection."""
         if self.rx_enabled:
-            GPIO.remove_event_detect(self.gpio)
+            self.pin.irq(None, Pin.IRQ_RISING | Pin.IRQ_FALLING) # TODO is this the right way to disable IRQ?
+            #GPIO.remove_event_detect(self.gpio)
             self.rx_enabled = False
             _LOGGER.debug("RX disabled")
         return True
 
     # pylint: disable=unused-argument
-    def rx_callback(self, gpio):
+    def rx_callback(self, pin):
         """RX callback for GPIO event detection. Handle basic signal detection."""
-        timestamp = int(time.perf_counter() * 1000000)
-        duration = timestamp - self._rx_last_timestamp
+        # _LOGGER.debug("RX callback called")
+        timestamp =  utime.ticks_us()# use ticks_us instead
+        # _LOGGER.debug("timestamp_us: %s" % timestamp)
+        # timestamp = int(time.perf_counter() * 1000000)
+        duration = timestamp - self._rx_last_timestamp # first time duration=0
 
-        if duration > 5000:
+        if duration > 5000: # 5 ms
             if abs(duration - self._rx_timings[0]) < 200:
                 self._rx_repeat_count += 1
                 self._rx_change_count -= 1
@@ -250,9 +292,13 @@ class RFDevice:
             return True
 
         return False
-           
-    def _sleep(self, delay):      
-        _delay = delay / 100
-        end = time.time() + delay - _delay
-        while time.time() < end:
-            time.sleep(_delay)
+
+#    def _sleep(self, delay):
+#        """
+#        sleep amount of seconds
+#        :param delay <float>: seconds to sleep
+#        """
+#        _delay = delay / 100
+#        end = time.time() + delay - _delay
+#        while time.time() < end:
+#            time.sleep(_delay)
